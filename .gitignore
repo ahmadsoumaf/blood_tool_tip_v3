@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+yolo_test_env/
+
+# YOLO training outputs
+runs/
+datasets/
+*.pt
+*.onnx
+*.engine
+
+# Videos and recordings
+*.mp4
+*.avi
+*.mkv
+*.webm
+
+# Temporary files
+.DS_Store
