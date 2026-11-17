@@ -1,0 +1,6 @@
+time_s,frame,tip_detected,blood_detected,tip_u,tip_v,tip_depth_m,blood_depth_at_tip_m,height_above_blood_mm,in_blood,raw_in_blood,dist_mm,dist_mm_smoothed,status,cam_to_blood_mm,cam_to_blood_nearest_mm,cam_to_blood_smoothed_mm,blood_depth_valid_pct,aruco_ids
+4.867,1,0,0,,,,,,0,0,,,no_tip,,,,,
+4.954,2,0,0,,,,,,0,0,,,no_tip,,,,,
+8.734,3,1,1,259,77,0.5260,,,0,0,310.2,310.2,distance_3D,433.0,420.0,433.0,99,
+8.847,4,1,1,29,4,0.5520,,,0,0,530.4,420.3,distance_3D,434.0,419.0,433.0,100,
+9.480,5,1,1,27,6,0.5510,,,0,0,530.5,530.4,distance_3D,434.0,420.0,433.0,100,
