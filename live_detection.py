@@ -7,8 +7,13 @@ above the blood is reported as "above", not "in").
 
 Every run is logged automatically to logs/run_<date>_<time>.csv.
 
+Also detects ArUco markers (outline + ID only, no pose yet). The dictionary is
+auto-detected, or set it with --aruco-dict DICT_4X4_50. Disable with --no-aruco.
+
 Keys:
   q - quit
+  + / - - make the live window bigger / smaller (you can also drag its edge with the mouse)
+  0 - reset the live window to its normal size
   f - save the current raw camera image to new_training_images/
       (use this when the model makes a mistake, then label + retrain)
 """
@@ -30,6 +35,9 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--no-log", action="store_true", help="do not save a CSV log for this run")
 ap.add_argument("--snapshots", default=None, help="save an annotated frame every second to this folder")
 ap.add_argument("--seconds", type=float, default=0, help="stop automatically after N seconds (0 = run until q)")
+ap.add_argument("--aruco-dict", default="DICT_4X4_50", help="ArUco dictionary (default: DICT_4X4_50 = tray markers 0-3; pass auto to auto-detect)")
+ap.add_argument("--scale", type=float, default=1.0, help="start size of the live window, e.g. 1.5 = 150%%")
+ap.add_argument("--no-aruco", action="store_true", help="disable ArUco marker detection")
 args = ap.parse_args()
 
 DEVICE = 0 if torch.cuda.is_available() else "cpu"
@@ -37,9 +45,13 @@ PRECISION = 16 if DEVICE != "cpu" else None  # FP16 on GPU
 print("Inference device:", torch.cuda.get_device_name(0) if DEVICE != "cpu" else "CPU")
 
 model = YOLO("./weights/best.pt")
-print("YOLO v2 loaded:", model.names)
+print("YOLO v5 loaded:", model.names)
 
-BLOOD, TIP, INSTRUMENT = 0, 1, 2
+# v5 model classes: 0 = blood, 1 = instrument (whole tool, no separate tip class).
+# TIP is not predicted by the model; it is derived from the instrument mask below.
+BLOOD, INSTRUMENT = 0, 1
+TIP = -1               # internal id for the derived tip region
+TIP_RADIUS_PX = 8      # size of the derived tip region at the instrument's far end
 
 # ---------------- RealSense (colour + aligned depth) ----------------
 WIDTH, HEIGHT, FPS = 640, 480, 30
@@ -56,6 +68,51 @@ intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrins
 FX, FY, CX, CY = intr.fx, intr.fy, intr.ppx, intr.ppy
 
 print("RealSense camera opened (colour + depth)")
+
+# ---------------- ArUco markers (detection only, works on OpenCV 4.6 and 4.7+) ----------------
+aruco = cv2.aruco
+ARUCO_DICTS = [n for n in [
+    "DICT_4X4_50", "DICT_4X4_100", "DICT_4X4_250", "DICT_4X4_1000",
+    "DICT_5X5_50", "DICT_5X5_100", "DICT_5X5_250", "DICT_5X5_1000",
+    "DICT_6X6_50", "DICT_6X6_100", "DICT_6X6_250", "DICT_6X6_1000",
+    "DICT_7X7_50", "DICT_7X7_100", "DICT_7X7_250", "DICT_7X7_1000",
+    "DICT_ARUCO_ORIGINAL",
+    "DICT_APRILTAG_16h5", "DICT_APRILTAG_25h9", "DICT_APRILTAG_36h10", "DICT_APRILTAG_36h11",
+] if hasattr(aruco, n)]
+ARUCO_SCAN_EVERY = 15   # while the dictionary is unknown, try all dictionaries every N frames
+_aruco_params = aruco.DetectorParameters_create() if hasattr(aruco, "DetectorParameters_create") else aruco.DetectorParameters()
+_aruco_params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+_aruco_detectors = {}
+
+
+def aruco_detect(gray, name):
+    """Returns (corners, ids or None) for one dictionary."""
+    if hasattr(aruco, "ArucoDetector"):            # OpenCV >= 4.7
+        if name not in _aruco_detectors:
+            _aruco_detectors[name] = aruco.ArucoDetector(aruco.getPredefinedDictionary(getattr(aruco, name)), _aruco_params)
+        corners, ids, _ = _aruco_detectors[name].detectMarkers(gray)
+    else:                                           # OpenCV 4.6
+        corners, ids, _ = aruco.detectMarkers(gray, aruco.Dictionary_get(getattr(aruco, name)), parameters=_aruco_params)
+    return corners, ids
+
+
+def aruco_find_dict(gray):
+    """Try every dictionary, return the one that finds the most markers (or None)."""
+    best, best_n = None, 0
+    for name in ARUCO_DICTS:
+        _, ids = aruco_detect(gray, name)
+        n = 0 if ids is None else len(ids)
+        if n > best_n:              # strict '>' keeps the smaller dict on ties
+            best, best_n = name, n
+    return best, best_n
+
+
+aruco_dict = None if args.aruco_dict == "auto" else args.aruco_dict
+if aruco_dict and aruco_dict not in ARUCO_DICTS:
+    raise SystemExit(f"Unknown ArUco dictionary {aruco_dict}. Options: {', '.join(ARUCO_DICTS)}")
+aruco_on = not args.no_aruco
+if aruco_on:
+    print("ArUco detection:", aruco_dict or "auto-detecting dictionary")
 
 # Colours: BGR
 COLORS = {
@@ -102,7 +159,8 @@ if not args.no_log:
     log.writerow(["time_s", "frame", "tip_detected", "blood_detected", "tip_u", "tip_v",
                   "tip_depth_m", "blood_depth_at_tip_m", "height_above_blood_mm",
                   "in_blood", "raw_in_blood", "dist_mm", "dist_mm_smoothed", "status",
-                  "cam_to_blood_mm", "cam_to_blood_nearest_mm", "cam_to_blood_smoothed_mm", "blood_depth_valid_pct"])
+                  "cam_to_blood_mm", "cam_to_blood_nearest_mm", "cam_to_blood_smoothed_mm", "blood_depth_valid_pct",
+                  "aruco_ids"])
     print("Logging to", log_path)
 if args.snapshots:
     os.makedirs(args.snapshots, exist_ok=True)
@@ -125,6 +183,28 @@ def tip_point(tip_mask, depth_m):
         win = depth_m[max(v - 4, 0):v + 5, max(u - 4, 0):u + 5]
         z = win[win > 0]
     return (u, v), (float(np.median(z)) if z.size else None)
+
+
+def derive_tip_mask(inst_mask):
+    """The model segments the whole instrument. Estimate the tip as the end of the
+    instrument's long axis that is farther from the image border (the handle leaves
+    the frame, the tip points into the scene). Returns a small mask around that end."""
+    ys, xs = np.nonzero(inst_mask)
+    if len(xs) < 20:
+        return None
+    h, w = inst_mask.shape
+    pts = np.stack([xs, ys], axis=1).astype(np.float32)
+    mean = pts.mean(axis=0)
+    _, _, vt = np.linalg.svd(pts - mean, full_matrices=False)
+    proj = (pts - mean) @ vt[0]
+    ends = [pts[np.argmin(proj)], pts[np.argmax(proj)]]
+    def border_dist(p):
+        return min(p[0], p[1], w - 1 - p[0], h - 1 - p[1])
+    end = max(ends, key=border_dist)
+    yy, xx = np.ogrid[:h, :w]
+    disk = (xx - end[0]) ** 2 + (yy - end[1]) ** 2 <= TIP_RADIUS_PX ** 2
+    tip = disk & inst_mask
+    return tip if tip.any() else None
 
 
 def blood_depth_near_tip(tip_mask, blood_mask, depth_m):
@@ -227,11 +307,19 @@ def make_fovea_view(frame, depth_m, class_masks, center, tip_found):
     return np.vstack([np.hstack([col, dep]), bar])
 
 
-cv2.namedWindow(WIN_MAIN)
-cv2.namedWindow(WIN_DEPTH)
-cv2.namedWindow(WIN_FOVEA)
+# Resizable windows: drag the edge with the mouse, or +/- keys for the live window.
+# Only the display is scaled; recordings and logs keep the original 640x480.
+WIN_FLAGS = cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_NORMAL
+SCALE_STEP, SCALE_MIN, SCALE_MAX = 1.25, 0.5, 4.0
+win_scale = min(max(args.scale, SCALE_MIN), SCALE_MAX)
+cv2.namedWindow(WIN_MAIN, WIN_FLAGS)
+cv2.namedWindow(WIN_DEPTH, WIN_FLAGS)
+cv2.namedWindow(WIN_FOVEA, WIN_FLAGS)
+cv2.resizeWindow(WIN_MAIN, int(WIDTH * win_scale), int(HEIGHT * win_scale))
+cv2.resizeWindow(WIN_DEPTH, WIDTH, HEIGHT)
+cv2.resizeWindow(WIN_FOVEA, 2 * 64 * 6, 64 * 6 + 44)
 cv2.moveWindow(WIN_MAIN, 0, 0)
-cv2.moveWindow(WIN_DEPTH, WIDTH + 10, 0)
+cv2.moveWindow(WIN_DEPTH, int(WIDTH * win_scale) + 10, 0)
 cv2.moveWindow(WIN_FOVEA, 0, HEIGHT + 60)
 
 saved_msg_until = 0.0
@@ -263,16 +351,60 @@ def finish_video(writer, path):
     tmp = path.replace(".mp4", "_h264.mp4")
     real_s = run_end - t_start
     scale = real_s / (frame_idx / FPS) if frame_idx else 1.0
-    ok = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", path,
+    ok = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", path,
                          "-vf", f"setpts={scale:.5f}*PTS", "-r", str(FPS), "-c:v", "libx264",
-                         "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p", tmp]).returncode == 0
+                         "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p", tmp], stdin=subprocess.DEVNULL).returncode == 0
     if ok:
         os.replace(tmp, path)
     print("Video saved:", path)
 
+
+def combine_videos(main_path, fovea_path):
+    """One video: main view with the fovea view small in the bottom-right corner.
+    The two separate videos are deleted only if the combined one was made."""
+    out = main_path.replace(".mp4", "_combined.mp4")
+    pip = "[1:v]scale=256:-2:flags=neighbor,pad=iw+4:ih+4:2:2:white[pip];[0:v][pip]overlay=W-w-8:H-h-8"
+    ok = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", main_path, "-i", fovea_path,
+                         "-filter_complex", pip, "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                         "-pix_fmt", "yuv420p", out], stdin=subprocess.DEVNULL).returncode == 0
+    if ok and os.path.exists(out) and os.path.getsize(out) > 0:
+        os.remove(main_path)
+        os.remove(fovea_path)
+        print("Combined video saved:", out)
+    else:
+        print("WARNING: could not combine videos, keeping", main_path, "and", fovea_path)
+
+MAX_CAMERA_RESTARTS = 5  # consecutive failed recoveries before giving up
+
+
+def wait_for_frames_resilient():
+    """Like pipeline.wait_for_frames(), but survives camera stalls (USB hiccups).
+
+    A short stall is simply waited out; a longer one restarts the camera stream.
+    Only gives up (raises) if the camera stays dead after several restarts.
+    """
+    for attempt in range(1, MAX_CAMERA_RESTARTS + 1):
+        try:
+            return pipeline.wait_for_frames(2000)
+        except RuntimeError as e:
+            print(f"WARNING: camera stalled ({e}), restarting stream ({attempt}/{MAX_CAMERA_RESTARTS})...")
+        try:
+            pipeline.stop()
+        except RuntimeError:
+            pass
+        time.sleep(1.0)
+        try:
+            pipeline.start(config)
+            print("Camera stream restarted")
+        except RuntimeError as e:
+            print("WARNING: camera restart failed:", e)
+            time.sleep(2.0)
+    raise RuntimeError("Camera stopped delivering frames and could not be restarted (check the USB cable/port)")
+
+
 try:
     while True:
-        frames = align.process(pipeline.wait_for_frames())
+        frames = align.process(wait_for_frames_resilient())
         color_frame = frames.get_color_frame()
         depth_frame = frames.get_depth_frame()
         if not color_frame or not depth_frame:
@@ -309,12 +441,12 @@ try:
 
             # Merge all instances of the same class into one mask, so
             # overlapping detections don't stack and turn darker red.
-            for cls in (INSTRUMENT, BLOOD, TIP):  # tip drawn on top
+            for cls in (INSTRUMENT, BLOOD):
                 idx = np.where(classes == cls)[0]
                 if len(idx) == 0:
                     continue
-                if cls == TIP:
-                    idx = idx[[np.argmax(confs[idx])]]  # only the most confident tip
+                if cls == INSTRUMENT:
+                    idx = idx[[np.argmax(confs[idx])]]  # only the most confident instrument
                 merged = masks[idx].max(axis=0)
                 if merged.shape != (h, w):
                     merged = cv2.resize(merged, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -326,6 +458,28 @@ try:
                     (1 - ALPHA) * annotated[mask]
                     + ALPHA * np.array(color)
                 ).astype(np.uint8)
+
+        # derived tip: far end of the instrument mask (drawn on top in cyan)
+        if class_masks.get(INSTRUMENT) is not None:
+            tm = derive_tip_mask(class_masks[INSTRUMENT])
+            if tm is not None:
+                class_masks[TIP] = tm
+                annotated[tm] = ((1 - ALPHA) * annotated[tm] + ALPHA * np.array(COLORS[TIP])).astype(np.uint8)
+
+        # ---------------- ArUco markers (detection only) ----------------
+        aruco_ids = []
+        if aruco_on:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if aruco_dict is None and frame_idx % ARUCO_SCAN_EVERY == 0:
+                found, n = aruco_find_dict(gray)
+                if found:
+                    aruco_dict = found
+                    print(f"ArUco dictionary detected: {aruco_dict} ({n} markers in view)")
+            if aruco_dict is not None:
+                a_corners, a_ids = aruco_detect(gray, aruco_dict)
+                if a_ids is not None:
+                    aruco.drawDetectedMarkers(annotated, a_corners, a_ids)
+                    aruco_ids = sorted(int(i) for i in a_ids.flatten())
 
         # ---------------- camera -> blood ----------------
         cam_blood_mm = cam_blood_near_mm = cam_valid_pct = None
@@ -455,6 +609,10 @@ try:
             put(annotated, "Image saved for training", (10, 126), (255, 0, 255), 0.6)
         if log:
             put(annotated, "REC", (WIDTH - 60, 30), (0, 0, 255), 0.6)
+        if aruco_on:
+            a_txt = (f"ArUco {len(aruco_ids)}: " + ",".join(map(str, aruco_ids))) if aruco_ids else \
+                    ("ArUco: none" if aruco_dict else "ArUco: searching...")
+            put(annotated, a_txt, (10, HEIGHT - 12), (0, 255, 0) if aruco_ids else (160, 160, 160), 0.6)
 
         # fovea follows the tip (smoothed); holds last position if the tip is lost
         if tip_px is not None:
@@ -495,7 +653,7 @@ try:
                           fmt(rec["tip_z"], "%.4f"), fmt(rec["blood_z"], "%.4f"), fmt(rec["height"], "%.1f"),
                           int(in_blood_state), rec["raw_in"], fmt(rec["dist_mm"], "%.1f"), fmt(dist_mm_s, "%.1f"), rec["status"],
                           fmt(cam_blood_mm, "%.1f"), fmt(cam_blood_near_mm, "%.1f"), fmt(cam_blood_s, "%.1f"),
-                          fmt(cam_valid_pct, "%.0f")])
+                          fmt(cam_valid_pct, "%.0f"), " ".join(map(str, aruco_ids))])
         if args.snapshots and elapsed_s - last_snap >= 1.0:
             last_snap = elapsed_s
             cv2.imwrite(os.path.join(args.snapshots, f"snap_{int(elapsed_s):04d}.jpg"), annotated)
@@ -503,6 +661,15 @@ try:
             break
 
         key = cv2.waitKey(1) & 0xFF
+        if key in (ord("+"), ord("=")) or key in (ord("-"), ord("_")) or key == ord("0"):
+            if key == ord("0"):
+                win_scale = 1.0
+            elif key in (ord("+"), ord("=")):
+                win_scale = min(win_scale * SCALE_STEP, SCALE_MAX)
+            else:
+                win_scale = max(win_scale / SCALE_STEP, SCALE_MIN)
+            cv2.resizeWindow(WIN_MAIN, int(WIDTH * win_scale), int(HEIGHT * win_scale))
+            print(f"Live window size: {win_scale * 100:.0f}%")
         if key == ord("q"):
             break
         if key == ord("f"):  # save the RAW image (no overlay) for retraining
@@ -514,12 +681,17 @@ try:
 
 finally:
     run_end = time.time()
-    pipeline.stop()
+    try:
+        pipeline.stop()
+    except RuntimeError:
+        pass  # already stopped (camera was lost)
     cv2.destroyAllWindows()
     if log_f:
         log_f.close()
         print("Log saved:", log_path)
     if video_writer:
+        print("Converting videos, please wait (can take a few minutes for long runs, don't type or press Ctrl+C)...")
         finish_video(video_writer, video_path)
         finish_video(fovea_writer, fovea_path)
         finish_video(raw_writer, raw_path)
+        combine_videos(video_path, fovea_path)
