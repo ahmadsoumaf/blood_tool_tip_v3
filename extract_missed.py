@@ -54,7 +54,7 @@ COLORS = {0: (0, 0, 255), 1: (0, 255, 0)}
 for sub in ("images", "labels", "preview"):
     os.makedirs(os.path.join(args.out, sub), exist_ok=True)
 device = 0 if torch.cuda.is_available() else "cpu"
-model = YOLO("./weights/best.pt")
+model = YOLO("./weights/best_v7.pt")
 
 
 def duration(path):

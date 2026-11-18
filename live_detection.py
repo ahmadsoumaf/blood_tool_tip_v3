@@ -32,6 +32,7 @@ import torch
 from ultralytics import YOLO
 
 ap = argparse.ArgumentParser()
+ap.add_argument("--weights", default="best_v7.pt", help="model file to use: a name inside weights/ (e.g. best_v7.pt) or a full path")
 ap.add_argument("--no-log", action="store_true", help="do not save a CSV log for this run")
 ap.add_argument("--snapshots", default=None, help="save an annotated frame every second to this folder")
 ap.add_argument("--seconds", type=float, default=0, help="stop automatically after N seconds (0 = run until q)")
@@ -44,7 +45,12 @@ DEVICE = 0 if torch.cuda.is_available() else "cpu"
 PRECISION = 16 if DEVICE != "cpu" else None  # FP16 on GPU
 print("Inference device:", torch.cuda.get_device_name(0) if DEVICE != "cpu" else "CPU")
 
-model = YOLO("./weights/best.pt")
+_wdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights")
+_wpath = args.weights if os.path.exists(args.weights) else os.path.join(_wdir, args.weights)
+if not os.path.exists(_wpath):
+    raise SystemExit(f"Weights not found: {args.weights}  (available: {sorted(f for f in os.listdir(_wdir) if f.endswith('.pt'))})")
+print("Using weights:", _wpath)
+model = YOLO(_wpath)
 print("YOLO v5 loaded:", model.names)
 
 # v5 model classes: 0 = blood, 1 = instrument (whole tool, no separate tip class).
