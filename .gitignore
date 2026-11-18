@@ -24,3 +24,4 @@ datasets/
 # Temporary files
 .DS_Store
 train_images/
+poor_detection_ecm_run_*/
